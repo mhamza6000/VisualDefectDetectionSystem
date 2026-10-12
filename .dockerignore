@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+archive (1).zip
+casting_extracted/
+casting_imagefolder/*
+!casting_imagefolder/final_model/
+!casting_imagefolder/final_model/**

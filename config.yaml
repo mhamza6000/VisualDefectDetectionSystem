@@ -1,0 +1,19 @@
+preprocessing:
+  image_size: 224
+  grayscale: true
+  gaussian_blur:
+    enabled: true
+    kernel_size: 3
+    sigma: 0.5
+  augmentation:
+    horizontal_flip: true
+    vertical_flip: true
+    rotation_degrees: 10
+    translation_fraction: 0.05
+
+training:
+  batch_size: 16
+  imbalance_strategy: inverse_frequency
+
+inference:
+  defective_threshold: 0.4

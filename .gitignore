@@ -1,0 +1,18 @@
+# Python environments and generated caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Local dataset source and extracted/split images
+archive (1).zip
+casting_extracted/
+casting_imagefolder/
+
+# Local debug logs
+*.log
+
+# Editor-local configuration
+.vscode/
+.idea/

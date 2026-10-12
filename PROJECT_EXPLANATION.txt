@@ -1,0 +1,403 @@
+PRODUCT DEFECT CLASSIFIER
+Technical project walkthrough
+
+1. PROJECT PURPOSE
+
+This project automates a visual inspection task: given an image of a cast
+product, predict whether it is Normal or Defective. It includes a data
+preparation and training pipeline, evaluation and error analysis, and a
+FastAPI inference service packaged in Docker.
+
+The end-to-end flow is:
+
+  archive (1).zip
+      |
+      v
+  Extract images and assign labels from source class folders
+      |
+      v
+  Remove exact duplicates, create a reproducible train/validation/test split
+      |
+      v
+  Preprocess and augment training images
+      |
+      v
+  Fine-tune a pretrained ConvNeXt classifier
+      |
+      v
+  Evaluate on the held-out test split and inspect mistakes
+      |
+      v
+  Save the model and serve image predictions through FastAPI
+      |
+      v
+  Package the API, dependencies, and model in a Docker image
+
+
+2. DATASET PREPARATION
+
+Dataprep.py is responsible for loading and preparing the image data.
+
+ - It expects "archive (1).zip" next to the Python files.
+ - It extracts supported image types from the "casting_512x512" archive path.
+ - The source folder named "def_front" maps to the label "Defective".
+ - The source folder named "ok_front" maps to the label "Normal".
+ - It calculates a SHA-256 hash for every image and removes exact duplicate
+   image contents before splitting.
+ - If identical contents occur under both labels, it stops and reports the
+   conflict rather than silently choosing a label.
+ - It saves the images into flat train, validation, and test folders and writes
+   image_labels.csv, a manifest recording each image, label, hash, and split.
+ - Dataset examples can be displayed before the split.
+
+The split is stratified and uses a fixed random seed (42), so both classes
+retain similar proportions and the partition is reproducible. The saved
+manifest currently contains 1,300 images:
+
+                   Normal   Defective   Total
+  Training           363        547       910
+  Validation          78        117       195
+  Test                78        117       195
+  Total              519        781      1300
+
+The source distribution is imbalanced: there are more Defective than Normal
+images. The training pipeline compensates with inverse-frequency class weights
+in the loss function. This gives relatively more importance to examples from
+the less frequent Normal class while optimizing the classifier.
+
+The split folders are flat rather than one-folder-per-class. The custom
+CastingImageDataset reads image_labels.csv to find each image's label and
+split; it is not relying on torchvision ImageFolder's folder-name labels.
+
+
+3. IMAGE PREPROCESSING AND AUGMENTATION
+
+preprocessing.py builds the image transforms used by the dataset and by the
+API. config.yaml supplies their settings.
+
+For each image, the pipeline:
+
+  1. Converts it to grayscale and replicates that channel three times, because
+     the pretrained model expects a three-channel image.
+  2. Applies a light Gaussian blur.
+  3. Resizes it to 224 x 224 pixels.
+  4. For training images only, may apply horizontal and vertical flips, a
+     rotation of up to 10 degrees, and small translations.
+  5. Converts the result to a tensor and normalizes it using the pretrained
+     image processor's channel means and standard deviations.
+
+Augmentation is not applied to validation, test, or API inference images.
+This keeps evaluation and serving deterministic while exposing the training
+process to modest image variations.
+
+
+4. MODEL CHOICE AND TRAINING
+
+model.py loads the pretrained facebook/convnext-tiny-224 image classifier and
+its image processor. ConvNeXt-Tiny is a modern convolutional image
+architecture, and its pretrained visual features are a practical starting
+point for a relatively small dataset. It offers useful image representations
+without the training cost of a much larger model.
+
+The pretrained classifier is replaced with a two-class output layer:
+
+  class 0 = Normal
+  class 1 = Defective
+
+The full ConvNeXt model is fine-tuned. The pretrained backbone receives a
+learning rate 100 times smaller than the new classification head, helping it
+adapt to casting-specific visual features while limiting large changes to its
+pretrained weights. Full fine-tuning costs more training time and memory than
+freezing the backbone, and still needs validation to confirm that it improves
+generalization.
+
+train_model.py performs stratified five-fold cross-validation using only the
+training partition. In each fold, it fine-tunes the model, calculates metrics,
+and keeps that fold's checkpoint according to validation loss. It then trains
+a final model using the training partition and selects its saved checkpoint by
+validation loss. The test partition is kept out of these training and
+model-selection steps.
+
+The loss is cross-entropy with inverse-frequency weights by default. The
+metrics calculated during training include accuracy, precision, recall, F1,
+and ROC-AUC. Training history and validation diagnostics are plotted.
+For the final model, a Defective probability threshold is selected on the
+validation split by maximizing Defective-class F1. The chosen threshold is
+stored in the model configuration and used for held-out test evaluation and
+API predictions. This balances false positives and false negatives without
+using the test split for threshold selection.
+
+main.py orchestrates the steps. Its current defaults prepare the dataset,
+display sample images, skip the optional K-means label check, skip optional
+hyperparameter search, run five-fold cross-validation, train the final model,
+and evaluate the held-out test set.
+
+The optional K-means check in kmeans_check.py groups simple resized grayscale
+pixel representations into clusters and compares those clusters with the
+provided labels. Disagreement is only a candidate for human review; it does
+not establish that a label is wrong and it never changes labels automatically.
+The optional hyperparameter search tries five random configurations for
+learning rate (1e-5 to 1e-3), batch size (8, 16, or 32), and weight decay
+(0, 0.001, or 0.01). Each configuration trains for one epoch on the training
+split and is evaluated once on the existing validation split. The search does
+not perform cross-validation or tune the epoch count; it uses validation
+ROC-AUC to choose the best configuration. That learning rate, batch size, and
+weight decay are passed into the main cross-validation and final-model
+training, where the normal training epoch settings are used. Full-backbone
+fine-tuning remains enabled, with a smaller learning rate for pretrained
+features than for the classifier head. Both the search and K-means option are
+disabled by default.
+
+
+5. EVALUATION AND ERROR ANALYSIS
+
+evaluate_model.py loads the saved final model and evaluates it on the held-out
+test split. It reports accuracy, precision, recall, F1, and ROC-AUC, creates a
+confusion matrix and ROC curve, writes per-image predictions to
+casting_imagefolder/test_predictions.csv, and displays false positives and
+false negatives when present.
+
+The existing test_predictions.csv contains 195 test predictions from the
+previous frozen-backbone checkpoint at the 0.4 fallback threshold. Calculating
+metrics from those saved labels and predictions gives this baseline:
+
+  Accuracy:                 0.8205 (82.05%)
+  Defective precision:      0.8727 (87.27%)
+  Defective recall:         0.8205 (82.05%)
+  Defective F1-score:       0.8458 (84.58%)
+
+Confusion matrix, with actual labels as rows and predicted labels as columns:
+
+                       Predicted Normal   Predicted Defective
+  Actual Normal                 64                  14
+  Actual Defective              21                  96
+
+There are 14 false positives: Normal items classified as Defective. There are
+21 false negatives: Defective items classified as Normal. In manufacturing,
+false negatives can allow defective products to pass inspection; false
+positives can trigger unnecessary inspection or rejection. The cost of each
+error should be agreed with the client before selecting a production operating
+threshold.
+
+For newly trained models, the selected validation F1 threshold is stored in
+the checkpoint. A Defective probability at or above it is classified as
+Defective. Lowering a threshold usually catches more defects but can increase
+false positives; raising it can reduce false alarms but miss more defects.
+Threshold selection uses validation data, not test results.
+
+The metrics above were computed from the predictions already saved in the
+workspace; this explanation does not rerun training or test evaluation.
+ROC-AUC is calculated by evaluate_model.py at evaluation time and is shown in
+the generated plot/console output; it is not derivable from the saved
+test_predictions.csv because that CSV stores class labels, not probabilities.
+No inference latency benchmark is currently recorded.
+
+
+6. INFERENCE API
+
+api.py defines a FastAPI service. Uvicorn is the web server process that runs
+the FastAPI application. The app loads the model and image processor once when
+the service starts, then reuses them for incoming requests.
+
+Routes:
+
+  GET  /health
+       Returns {"status":"ready"} after the model has loaded.
+
+  POST /predict
+       Accepts a multipart form upload under the field name "image_file".
+       Validates the image, preprocesses it with the same deterministic
+       preprocessing used for evaluation, runs inference, and returns JSON.
+
+Example response:
+
+  {
+    "predicted_class": "Defective",
+    "confidence_score": 0.9475,
+    "class_probabilities": {
+      "Normal": 0.0525,
+      "Defective": 0.9475
+    }
+  }
+
+The confidence score is the model's softmax probability for the selected
+class. It is not a calibrated probability and should not be interpreted as a
+guarantee that the prediction is correct.
+
+The API rejects uploads that do not have an image content type, are empty,
+cannot be decoded, exceed 10 MB, or exceed the configured pixel limit. It
+returns explicit HTTP errors for invalid requests and logs model startup,
+inference failures, and predictions. The unit tests use stub models so they
+can test API behavior without loading the trained checkpoint.
+
+The application defines /health and /predict, but no route at /. Therefore,
+opening the base URL can correctly return {"detail":"Not Found"}. The
+interactive API documentation is available at /docs.
+
+The final model's validation-selected defective threshold is used when it is
+present in the checkpoint. Older checkpoints without this setting use the
+fallback threshold from config.yaml.
+
+
+7. DOCKER AND RUNNING THE API
+
+Docker packages the runtime environment so the API can run without manually
+installing its Python packages on the host. The Dockerfile:
+
+ - Starts from a small Python 3.11 base image.
+ - Installs CPU versions of PyTorch and torchvision and the API dependencies.
+ - Copies api.py, preprocessing.py, config.yaml, and the trained model into the
+   image.
+ - Sets MODEL_DIR to /app/model.
+ - Runs Uvicorn on container port 8000.
+ - Defines a Docker health check that calls /health.
+
+requirements-api.txt contains the serving dependencies. requirements.txt
+contains dependencies for training as well as serving.
+
+For this workspace, the Docker image was built as
+"product-defect-classifier:latest". The API container is named
+"product-defect-classifier-api" and is configured to restart unless stopped.
+The host's port 8000 was already occupied, so the container port 8000 was
+mapped to host port 8001 and bound only to localhost:
+
+  127.0.0.1:8001 on the host -> port 8000 in the container
+
+The local API documentation is therefore:
+
+  http://127.0.0.1:8001/docs
+
+The readiness endpoint is:
+
+  http://127.0.0.1:8001/health
+
+To make a prediction interactively, open /docs, expand POST /predict, choose
+"Try it out", select an image in image_file, and execute the request. A
+previous live smoke test using a test image returned Defective with a
+confidence score of approximately 0.9475.
+
+Example Docker commands for a fresh build and run are:
+
+  docker build -t product-defect-classifier:latest .
+  docker run -d --name product-defect-classifier-api -p 127.0.0.1:8001:8000 --restart unless-stopped product-defect-classifier:latest
+
+If host port 8001 is also unavailable, choose another unused host port while
+keeping container port 8000, for example -p 127.0.0.1:8002:8000.
+
+
+8. PROJECT FILE GUIDE
+
+  Dataprep.py
+      Archive extraction, source-folder label mapping, duplicate detection,
+      manifest creation, train/validation/test splitting, and dataset loading.
+
+  preprocessing.py
+      Shared image transforms and the configured Defective decision threshold.
+
+  config.yaml
+      Image size, grayscale/blur/augmentation options, batch size, imbalance
+      strategy, and inference threshold.
+
+  model.py
+      Pretrained ConvNeXt loading and two-class output head.
+
+  train_model.py
+      Training configuration, differential learning rates, weighted loss,
+      cross-validation, final model training, checkpoint selection, and
+      validation threshold selection.
+
+  hyperparameter_search.py
+      Optional quick search for learning rate, batch size, and weight decay
+      using one training epoch and the existing validation split.
+
+  kmeans_check.py
+      Optional unsupervised label-disagreement report for human inspection.
+
+  evaluate_model.py
+      Held-out test evaluation, metrics, confusion/ROC plots, and saved
+      per-image test predictions.
+
+  visualization.py
+      Dataset previews, training/evaluation plots, and false-positive/
+      false-negative image displays.
+
+  api.py
+      FastAPI health and prediction endpoints, upload validation, inference,
+      JSON response, and API logging.
+
+  Dockerfile
+      Instructions to package the CPU inference service and model.
+
+  requirements.txt
+      Python packages for training, evaluation, and serving.
+
+  requirements-api.txt
+      Smaller set of Python packages needed for inference serving.
+
+  tests/test_training_data.py
+      Tests for data splitting, class weighting, preprocessing output, and
+      missing split-image fallback.
+
+  tests/test_api.py
+      Tests for health, prediction response, threshold behavior, and invalid
+      uploads.
+
+  casting_imagefolder/
+      Prepared split images, image_labels.csv, final model, fold checkpoints,
+      test predictions, and generated plots.
+
+
+9. REPRODUCING AND TESTING
+
+From the project directory, with the Python environment and dependencies
+installed:
+
+  python main.py
+
+This prepares the dataset, runs the enabled training and evaluation steps,
+and saves/updates the model and evaluation artifacts. Training starts from the
+pretrained Hugging Face ConvNeXt checkpoint, so the pretrained weights must be
+available during training. The inference Docker image uses the saved local
+checkpoint and does not need to download pretrained weights at startup.
+
+Run the unit tests with:
+
+  python -m unittest discover -s tests -v
+
+Train/evaluation outputs are generated under casting_imagefolder/. Re-running
+the pipeline can replace the split folders and model checkpoints, so keep a
+backup of any artifacts that need to be preserved.
+
+
+10. LIMITATIONS AND PRODUCTION CONSIDERATIONS
+
+This project demonstrates a complete prototype-to-inference workflow, but it
+is not by itself a complete industrial deployment.
+
+ - The dataset is small and comes from a particular image source; performance
+   may drop under different cameras, lighting, product variants, or defect
+   types.
+ - A binary classifier does not locate or explain the defect in the image.
+ - Full fine-tuning may take longer and require more memory than training only
+   the classifier head.
+ - The reported test set is small (195 images), so the metrics have statistical
+   uncertainty. Repeat evaluation with additional production data before
+   relying on the system.
+ - The selected 0.4 decision threshold is a configurable recall-oriented
+   fallback for older checkpoints; newly trained checkpoints select a
+   threshold on validation data, which still may not be optimal in production.
+ - The confidence score is not calibrated.
+ - No latency, throughput, or memory benchmark is recorded; measure these on
+   the actual target hardware and expected image/request load.
+ - The API does not provide authentication, TLS termination, rate limiting,
+   durable request storage, or production monitoring. Put it behind a
+   suitably configured gateway/reverse proxy before exposing it beyond the
+   local machine.
+ - There is no separate architecture image or demonstration video in the
+   project folder. A GitHub repository and video would need to be prepared as
+   submission deliverables if required.
+
+Before production use, review false negatives with manufacturing experts,
+confirm labels and decision costs, validate on a separate representative
+production dataset, calibrate confidence if it will inform decisions, and
+measure end-to-end latency and system reliability.
